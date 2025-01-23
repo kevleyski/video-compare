@@ -283,3 +283,94 @@ For details, check out the [open GitHub issue thread](https://github.com/pixop/v
 ## Contributing
 
 We're always looking for ways to improve and expand the tool. Your feedback and contributions are appreciated.
+
+
+
+## KJSL
+
+Usage: ./video-compare [OPTIONS]... FILE1 FILE2
+
+    -h, --help
+        show help
+    -c, --show-controls
+        show controls
+    -v, --verbose
+        enable verbose output, including information such as library versions and rendering details
+    -d, --high-dpi
+        allow high DPI mode for e.g. displaying UHD content on Retina displays
+    -b, --10-bpc
+        use 10 bits per color component instead of 8
+    -F, --fast-alignment
+        toggle faster bilinear scaling for aligning input source resolutions, replacing higher-quality bicubic interpolation when resolutions differ
+    -I, --bilinear-texture
+        toggle bilinear video texture interpolation, replacing nearest-neighbor filtering
+    -n, --display-number
+        open main window on specific display (e.g. 0, 1 or 2), default is 0
+    -m, --mode
+        display mode (layout), 'split' for split screen (default), 'vstack' for vertical stack, 'hstack' for horizontal stack
+    -w, --window-size
+        override window size, specified as [width]x[height] (e.g. 800x600, 1280x or x480)
+    -W, --window-fit-display
+        calculate the window size to fit within the usable display bounds while maintaining the video aspect ratio
+    -a, --auto-loop-mode
+        auto-loop playback when buffer fills, 'off' for continuous streaming (default), 'on' for forward-only mode, 'pp' for ping-pong mode
+    -f, --frame-buffer-size
+        frame buffer size (e.g. 10, 70 or 150), default is 50
+    -t, --time-shift
+        shift the time stamps of the right video by a user-specified number of seconds (e.g. 0.150, -0.1 or 1)
+    -s, --wheel-sensitivity
+        mouse wheel sensitivity (e.g. 0.5, -1 or 1.7), default is 1; negative values invert the input direction
+    -C, --color-space
+        set the color space matrix, specified as [matrix] for the same on both sides, or [l-matrix?]:[r-matrix?] for different values (e.g. 'bt709' or 'bt2020nc:')
+    -A, --color-range
+        set the color range, specified as [range] for the same on both sides, or [l-range?]:[r-range?] for different values (e.g. 'tv', ':pc' or 'pc:tv')
+    -P, --color-primaries
+        set the color primaries, specified as [primaries] for the same on both sides, or [l-primaries?]:[r-primaries?] for different values (e.g. 'bt709' or 'bt2020:bt709')
+    -N, --color-trc
+        set the transfer characteristics (transfer curve), specified as [trc] for the same on both sides, or [l-trc?]:[r-trc?] for different values (e.g. 'bt709' or 'smpte2084:')
+    -T, --tone-map-mode
+        adapt tones for sRGB display: 'auto' (default) for automatic HDR, 'off' for none, 'on' for full-range mapping, 'rel' for relative comparison (e.g. 'on', 'auto:off', ':rel')
+    -L, --left-peak-nits
+        left video peak luminance in nits (e.g. 850 or 1000), default is 100 for SDR and 500 for HDR
+    -R, --right-peak-nits
+        right video peak luminance in nits; see --left-peak-nits
+    -B, --boost-tone
+        adjust tone-mapping strength factor, specified as [factor] for the same on both sides, or [l-factor?]:[r-factor?] for different values (e.g. '0.6', ':3' or '2:1.5')
+    -i, --filters
+        specify a comma-separated list of FFmpeg filters to be applied to both sides (e.g. scale=1920:-2,delogo=x=10:y=10:w=100:h=70)
+    -l, --left-filters
+        specify a comma-separated list of FFmpeg filters to be applied to the left video (e.g. format=gray,crop=iw:ih-240)
+    -r, --right-filters
+        specify a comma-separated list of FFmpeg filters to be applied to the right video (e.g. yadif,hqdn3d,pad=iw+320:ih:160:0)
+    --find-filters
+        find FFmpeg video filters that match the provided search term (e.g. 'scale', 'libvmaf' or 'dnn'; use "" to list all)
+    --find-protocols
+        find FFmpeg input protocols that match the provided search term (e.g. 'ipfs', 'srt', or 'rtmp'; use "" to list all)
+    --demuxer
+        left FFmpeg video demuxer name for both sides, specified as [type?][:options?] (e.g. 'rawvideo:pixel_format=rgb24,video_size=320x240,framerate=10')
+    --left-demuxer
+        left FFmpeg video demuxer name, specified as [type?][:options?]
+    --right-demuxer
+        right FFmpeg video demuxer name, specified as [type?][:options?]
+    --find-demuxers
+        find FFmpeg video demuxers that match the provided search term (e.g. 'matroska', 'mp4', 'vapoursynth' or 'pipe'; use "" to list all)
+    --decoder
+        FFmpeg video decoder name for both sides, specified as [type?][:options?] (e.g. ':strict=unofficial', ':strict=-2' or 'vvc:strict=experimental')
+    --left-decoder
+        left FFmpeg video decoder name, specified as [type?][:options?] (e.g. ':strict=-2,trust_dec_pts=1' or 'h264:trust_dec_pts=1')
+    --right-decoder
+        right FFmpeg video decoder name, specified as [type?][:options?]
+    --find-decoders
+        find FFmpeg video decoders that match the provided search term (e.g. 'h264', 'hevc', 'av1' or 'cuvid'; use "" to list all)
+    --hwaccel
+        FFmpeg video hardware acceleration for both sides, specified as [type][:device?[:options?]] (e.g. 'videotoolbox' or 'vaapi:/dev/dri/renderD128')
+    --left-hwaccel
+        left FFmpeg video hardware acceleration, specified as [type][:device?[:options?]] (e.g. 'cuda', 'cuda:1' or 'vulkan')
+    --right-hwaccel
+        right FFmpeg video hardware acceleration, specified as [type][:device?[:options?]]
+    --find-hwaccels
+        find FFmpeg video hardware acceleration types that match the provided search term (e.g. 'videotoolbox' or 'vulkan'; use "" to list all)
+    --libvmaf-options
+        libvmaf FFmpeg filter options (e.g. 'model=version=vmaf_4k_v0.6.1' or 'model=version=vmaf_v0.6.1\\:name=hd|version=vmaf_4k_v0.6.1\\:name=4k')
+    --no-auto-filters
+        disable the default behaviour of automatically injecting filters for deinterlacing, DAR correction, frame rate harmonization, rotation and colorimetry
