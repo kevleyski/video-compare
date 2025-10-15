@@ -10,6 +10,31 @@ extern "C" {
 #include <libavutil/rational.h>
 }
 
+// Constexpr string utilities
+namespace ConstexprStringUtils {
+// constexpr strlen for char literals
+constexpr size_t cstrlen(const char* s) {
+  size_t n = 0;
+  while (s[n] != '\0') {
+    ++n;
+  }
+  return n;
+}
+
+// Find the longest string length in an array of const char*
+template <size_t N>
+constexpr size_t longest_string_length(const char* const (&strings)[N]) {
+  size_t max_len = 0;
+  for (size_t i = 0; i < N; ++i) {
+    const size_t len = cstrlen(strings[i]);
+    if (len > max_len) {
+      max_len = len;
+    }
+  }
+  return max_len;
+}
+}  // namespace ConstexprStringUtils
+
 // Credits to user2622016 for this C++11 approach
 // https://stackoverflow.com/questions/2342162/stdstring-formatting-like-sprintf
 template <typename... Args>
@@ -33,9 +58,19 @@ std::string format_position(const float position, const bool use_compact);
 
 std::string format_duration(const float duration);
 
+double parse_strict_double(const std::string& s);
+
+double parse_timestamps_to_seconds(const std::string& timestamp);
+
 std::string to_lower_case(const std::string& str);
 
+std::string to_upper_case(const std::string& str);
+
 std::string::const_iterator string_ci_find(std::string& str, const std::string& query);
+
+std::string stringify_field_order(const AVFieldOrder field_order, const std::string& unknown = "") noexcept;
+
+std::string stringify_frame_rate_only(const AVRational frame_rate) noexcept;
 
 std::string stringify_frame_rate(const AVRational frame_rate, const AVFieldOrder field_order) noexcept;
 

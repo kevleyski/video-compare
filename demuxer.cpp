@@ -19,15 +19,44 @@ Demuxer::Demuxer(const Side side, const std::string& demuxer_name, const std::st
   ffmpeg::check(file_name, avformat_open_input(&format_context_, file_name.c_str(), const_cast<AVInputFormat*>(input_format), &demuxer_options));
   ffmpeg::check_dict_is_empty(demuxer_options, string_sprintf("Demuxer %s", format_name().c_str()));
 
-  video_stream_index_ = ffmpeg::check(file_name, av_find_best_stream(format_context_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0));
-
-  AVDictionary* stream_codec_options = nullptr;
-  av_dict_copy(&stream_codec_options, decoder_options, 0);
+  // Try to find best stream first
+  video_stream_index_ = av_find_best_stream(format_context_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
 
   AVDictionary** opts_for_streams = (AVDictionary**)av_calloc(format_context_->nb_streams, sizeof(AVDictionary*));
-  opts_for_streams[video_stream_index_] = stream_codec_options;
 
+  // User-specified options are only used if we have a valid video stream index
+  if (video_stream_index_ >= 0) {
+    av_dict_copy(&opts_for_streams[video_stream_index_], decoder_options, 0);
+  }
+
+  // Achtung: avformat_find_stream_info() may modify the copied options
   ffmpeg::check(file_name, avformat_find_stream_info(format_context_, opts_for_streams));
+
+  if (format_context_->nb_streams == 0) {
+    throw std::runtime_error(file_name + ": No streams found in container");
+  }
+
+  if (video_stream_index_ < 0) {
+    // Try manual search for video stream
+    for (unsigned int i = 0; i < format_context_->nb_streams; i++) {
+      const AVStream* stream = format_context_->streams[i];
+
+      if (stream != nullptr && stream->codecpar != nullptr && stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        video_stream_index_ = i;
+        break;
+      }
+    }
+
+    if (video_stream_index_ < 0) {
+      throw std::runtime_error(file_name + ": No video stream found");
+    }
+  }
+
+  for (unsigned int i = 0; i < format_context_->nb_streams; i++) {
+    av_dict_free(&opts_for_streams[i]);
+  }
+
+  av_freep(&opts_for_streams);
 }
 
 Demuxer::~Demuxer() {
@@ -59,12 +88,22 @@ int64_t Demuxer::start_time() const {
 
 int Demuxer::rotation() const {
   double theta = 0;
+  const AVStream* stream = format_context_->streams[video_stream_index_];
 
-  uint8_t* displaymatrix = av_stream_get_side_data(format_context_->streams[video_stream_index_], AV_PKT_DATA_DISPLAYMATRIX, nullptr);
+#if LIBAVFORMAT_VERSION_MAJOR >= 62
+  const AVPacketSideData* side_data = av_packet_side_data_get(stream->codecpar->coded_side_data, stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+
+  // require 9 integers (3x3 matrix) + allow hypothetical padding
+  if (side_data != nullptr && side_data->data != nullptr && side_data->size >= int(9 * sizeof(int32_t))) {
+    theta = -av_display_rotation_get(reinterpret_cast<const int32_t*>(side_data->data));
+  }
+#else
+  uint8_t* displaymatrix = av_stream_get_side_data(stream, AV_PKT_DATA_DISPLAYMATRIX, nullptr);
 
   if (displaymatrix != nullptr) {
     theta = -av_display_rotation_get(reinterpret_cast<int32_t*>(displaymatrix));
   }
+#endif
 
   theta -= 360 * floor(theta / 360 + 0.9 / 360);
 

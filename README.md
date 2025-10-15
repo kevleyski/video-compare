@@ -159,6 +159,7 @@ see all supported options.
 ## Controls
 
 - H: Toggle on-screen help text for controls
+- V: Toggle video info overlay
 - Space: Toggle play/pause
 - Comma `,`: Toggle bidirectional in-buffer loop/pause
 - Period `.`: Toggle forward-only in-buffer loop/pause
@@ -195,6 +196,8 @@ see all supported options.
 - Plus `+`: Time-shift right video 1 frame forward
 - Minus `-`: Time-shift right video 1 frame backward
 - X: Show the current video frame and UI update rates (in FPS)
+- Y: Cycle through subtraction modes
+- U: Toggle luminance-only subtraction mode
 
 Move the mouse horizontally to adjust the movable slider position.
 
@@ -205,10 +208,17 @@ Left-click the mouse to perform a time seek based on the horizontal position of 
 mouse cursor relative to the window width (the target position is shown in the lower
 right corner).
 
-Hold the SHIFT key while pressing `D` to decode and move to the next frame.
+**Hold** `Shift` while pressing `D` to decode and move to the next frame.
 
-Hold CTRL while time-shifting with `+`/`-` for faster increments/decrements of 10 frames per
-keystroke. Similarly, hold down the ALT key for even bigger time-shifts of 100 frames.
+**Hold** `Ctrl` while time-shifting with `+`/`-` for faster increments/decrements of 10 frames
+per keystroke. Similarly, **hold** `Alt` for even larger time-shifts of 100 frames.
+
+Use `Ctrl+C` (Windows/Linux) or `Cmd+C` (macOS) to copy the current timestamp of the left video
+to the clipboard, and `Ctrl+V` (Windows/Linux) or `Cmd+V` (macOS) to paste a timestamp from the
+clipboard and seek to that position.
+
+Use `Shift+F` to select a region; cutouts from both frames and their concatenation will be saved
+as PNGs.
 
 ## Build
 
@@ -222,7 +232,13 @@ upgrade their existing SDL2 installation before compiling.
 On Debian GNU/Linux the required development packages can be installed via `apt`:
 
 ```sh
-apt install libavformat-dev libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev libswresample-dev libsdl2-dev libsdl2-ttf-dev
+apt install build-essential libavformat-dev libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev libswresample-dev libsdl2-dev libsdl2-ttf-dev
+```
+
+On Fedora Linux the required development packages can be installed via `dnf`:
+
+```sh
+dnf install make gcc-c++ ffmpeg-devel SDL2-devel SDL2_ttf-devel
 ```
 
 ### Instructions
@@ -233,7 +249,7 @@ Compile the source code via GNU Make:
 make
 ```
 
-The linked `video-compare` executable will be created in the soure code directory. To perform a system wide installation:
+The linked `video-compare` executable will be created in the source code directory. To perform a system wide installation:
 
 ```sh
 make install

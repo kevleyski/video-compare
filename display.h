@@ -5,12 +5,57 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
+#include "core_types.h"
+#include "row_workers.h"
+#include "string_utils.h"
 extern "C" {
 #include <libavutil/frame.h>
 }
+
+namespace MetadataProperties {
+constexpr const char* RESOLUTION = "Resolution";
+constexpr const char* SAMPLE_ASPECT_RATIO = "Sample Aspect Ratio";
+constexpr const char* DISPLAY_ASPECT_RATIO = "Display Aspect Ratio";
+constexpr const char* DURATION = "Duration";
+constexpr const char* FRAME_RATE = "Frame Rate";
+constexpr const char* FIELD_ORDER = "Field Order";
+constexpr const char* CODEC = "Codec";
+constexpr const char* HARDWARE_ACCELERATION = "Hardware Acceleration";
+constexpr const char* PIXEL_FORMAT = "Pixel Format";
+constexpr const char* COLOR_SPACE = "Color Space";
+constexpr const char* COLOR_PRIMARIES = "Color Primaries";
+constexpr const char* TRANSFER_CURVE = "Transfer Curve";
+constexpr const char* COLOR_RANGE = "Color Range";
+constexpr const char* CONTAINER = "Container";
+constexpr const char* FILE_SIZE = "File Size";
+constexpr const char* BIT_RATE = "Bit Rate";
+constexpr const char* FILTERS = "Filters";
+
+constexpr const char* const ALL[] = {RESOLUTION,      SAMPLE_ASPECT_RATIO, DISPLAY_ASPECT_RATIO, DURATION,  FRAME_RATE, FIELD_ORDER, CODEC,  HARDWARE_ACCELERATION, PIXEL_FORMAT, COLOR_SPACE,
+                                     COLOR_PRIMARIES, TRANSFER_CURVE,      COLOR_RANGE,          CONTAINER, FILE_SIZE,  BIT_RATE,    FILTERS};
+
+constexpr size_t COUNT = sizeof(ALL) / sizeof(ALL[0]);
+
+const size_t LONGEST = ConstexprStringUtils::longest_string_length<COUNT>(ALL);
+}  // namespace MetadataProperties
+
+struct VideoMetadata {
+  std::map<std::string, std::string> properties;
+
+  std::string get(const std::string& key, const std::string& default_value = "N/A") const {
+    auto it = properties.find(key);
+    return it != properties.end() ? it->second : default_value;
+  }
+
+  void set(const std::string& key, const std::string& value) { properties[key] = value; }
+};
+
+template <int Bpc>
+struct BitDepthTraits;
 
 struct SDL {
   SDL();
@@ -50,6 +95,7 @@ class Display {
  public:
   enum Mode { SPLIT, VSTACK, HSTACK };
   enum Loop { OFF, FORWARDONLY, PINGPONG };
+  enum class DiffMode { LegacyAbs, AbsLinear, AbsSqrt, SignedDiverging };
 
   std::string modeToString(const Mode& mode) {
     switch (mode) {
@@ -87,6 +133,7 @@ class Display {
   float font_scale_;
 
   bool show_help_{false};
+  bool show_metadata_{false};
   bool quit_{false};
   bool play_{true};
   Loop buffer_play_loop_mode_{OFF};
@@ -113,6 +160,18 @@ class Display {
   bool possibly_tick_playback_{false};
   bool show_fps_{false};
 
+  // Subtraction mode settings
+  DiffMode diff_mode_{DiffMode::AbsLinear};
+  bool diff_luma_only_{false};
+
+  // Rectangle selection state
+  enum class SelectionState { NONE, STARTED, COMPLETED };
+  SelectionState selection_state_{SelectionState::NONE};
+  Vector2D selection_start_{0.0F, 0.0F};
+  Vector2D selection_end_{0.0F, 0.0F};
+  bool selection_wrap_{false};
+  bool save_selected_area_{false};
+
   bool input_received_{true};
   int64_t previous_left_frame_pts_;
   int64_t previous_right_frame_pts_;
@@ -128,6 +187,7 @@ class Display {
   TTF_Font* big_font_;
   SDL_Cursor* normal_mode_cursor_;
   SDL_Cursor* pan_mode_cursor_;
+  SDL_Cursor* selection_mode_cursor_;
   uint8_t* diff_buffer_;
   uint32_t* left_buffer_{nullptr};
   uint32_t* right_buffer_{nullptr};
@@ -168,16 +228,40 @@ class Display {
   const std::string left_file_stem_;
   const std::string right_file_stem_;
   int saved_image_number_{1};
+  int saved_selected_image_number_{1};
+
+  std::vector<SDL_Texture*> metadata_textures_;
+  int metadata_total_height_{0};
+  int metadata_y_offset_{0};
+  VideoMetadata left_metadata_;
+  VideoMetadata right_metadata_;
+  bool last_swap_left_right_state_{false};
 
   std::vector<SDL_Texture*> help_textures_;
   int help_total_height_{0};
   int help_y_offset_{0};
+
+  // Thread pool for parallel processing
+  RowWorkers row_workers_;
 
   void print_verbose_info();
 
   void convert_to_packed_10_bpc(std::array<uint8_t*, 3> in_planes, std::array<size_t, 3> in_pitches, std::array<uint32_t*, 3> out_planes, std::array<size_t, 3> out_pitches, const SDL_Rect& roi);
 
   void update_difference(std::array<uint8_t*, 3> planes_left, std::array<size_t, 3> pitches_left, std::array<uint8_t*, 3> planes_right, std::array<size_t, 3> pitches_right, int split_x);
+
+  template <int Bpc>
+  float calculate_frame_p99(const typename BitDepthTraits<Bpc>::P* plane_left, const typename BitDepthTraits<Bpc>::P* plane_right, const size_t pitch_left, const size_t pitch_right, const int width_right) const;
+
+  template <int Bpc>
+  void process_difference_planes(const typename BitDepthTraits<Bpc>::P* plane_left0,
+                                 const typename BitDepthTraits<Bpc>::P* plane_right0,
+                                 typename BitDepthTraits<Bpc>::P* plane_difference0,
+                                 const size_t pitch_left,
+                                 const size_t pitch_right,
+                                 const size_t pitch_difference,
+                                 const int width_right,
+                                 const float diff_max) const;
 
   void save_image_frames(const AVFrame* left_frame, const AVFrame* right_frame);
 
@@ -213,12 +297,28 @@ class Display {
   float compute_psnr(const float* left_plane, const float* right_plane);
 
   void render_help();
+  void render_metadata_overlay();
+
+  SDL_Rect get_left_selection_rect() const;
+  void draw_selection_rect();
+  void possibly_save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame);
+  void save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame, const SDL_Rect& selection_rect);
 
   float compute_zoom_factor(const float zoom_level) const;
   Vector2D compute_relative_move_offset(const Vector2D& zoom_point, const float zoom_factor) const;
   void update_zoom_factor_and_move_offset(const float zoom_factor);
   void update_zoom_factor(const float zoom_factor);
   void update_move_offset(const Vector2D& move_offset);
+
+  struct ZoomRect {
+    Vector2D start;
+    Vector2D end;
+    Vector2D size;
+    float zoom_factor;
+  };
+  ZoomRect compute_zoom_rect() const;
+  Vector2D get_mouse_video_position(const int mouse_x, const int mouse_y, const ZoomRect& zoom_rect) const;
+  SDL_FRect video_to_zoom_space(const SDL_Rect& video_rect, const ZoomRect& zoom_rect);
 
   void update_playback_speed(const int playback_speed_level);
 
@@ -263,4 +363,6 @@ class Display {
   bool get_tick_playback() const;
   bool get_possibly_tick_playback() const;
   bool get_show_fps() const;
+
+  void update_metadata(const VideoMetadata left_metadata, const VideoMetadata right_metadata);
 };

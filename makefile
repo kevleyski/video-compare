@@ -4,9 +4,9 @@ CXXFLAGS = -g3 -Ofast -std=c++14 -D__STDC_CONSTANT_MACROS \
 		   -Woverloaded-virtual -Wno-unused -Wno-missing-field-initializers
 
 ifeq ($(findstring CYGWIN_NT-10.0, $(shell uname)), CYGWIN_NT-10.0)
-  FFMPEG_VERSION = 7.1-full_build-shared
-  SDL2_VERSION = 2.30.8
-  SDL2_TTF_VERSION = 2.22.0
+  FFMPEG_VERSION = 8.0-full_build-shared
+  SDL2_VERSION = 2.32.8
+  SDL2_TTF_VERSION = 2.24.0
 
   FFMPEG_PATH = ffmpeg-$(FFMPEG_VERSION)
   SDL2_PATH = SDL2-devel-$(SDL2_VERSION)-mingw/SDL2-$(SDL2_VERSION)/x86_64-w64-mingw32
@@ -43,7 +43,15 @@ ifneq "$(wildcard /usr/include/ffmpeg)" ""
   CXXFLAGS += -I/usr/include/ffmpeg
 endif
 
-LDLIBS += -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lSDL2 -lSDL2_ttf
+# Default: don't use pkg-config unless user explicitly enables it
+# Usage: make USE_PKG_CONFIG=1
+USE_PKG_CONFIG ?= 0
+
+ifeq ($(USE_PKG_CONFIG),1)
+  LDLIBS += $(shell pkg-config --libs libavformat libavcodec libavfilter libavutil libswscale libswresample sdl2 SDL2_ttf)
+else
+  LDLIBS += -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lSDL2_ttf -lSDL2
+endif
 
 src = $(wildcard *.cpp)
 obj = $(src:.cpp=.o)

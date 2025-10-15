@@ -164,7 +164,13 @@ bool VideoDecoder::receive(AVFrame* frame, Demuxer* demuxer) {
   }
   ffmpeg::check(ret);
 
-  const bool use_avframe_state = trust_decoded_pts_ || next_pts_ == AV_NOPTS_VALUE || frame->key_frame || frame->pts == first_pts_;
+#if defined(AV_FRAME_FLAG_KEY)
+  const bool is_key = (frame->flags & AV_FRAME_FLAG_KEY) != 0;
+#else
+  const bool is_key = frame->key_frame != 0;
+#endif
+
+  const bool use_avframe_state = trust_decoded_pts_ || next_pts_ == AV_NOPTS_VALUE || is_key || frame->pts == first_pts_;
   const int64_t avframe_pts = frame->pts != AV_NOPTS_VALUE ? frame->pts : (frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : 0);
 
   // use an increasing timestamp via pkt_duration between keyframes; otherwise, fall back to the best effort timestamp when PTS is not available
@@ -233,8 +239,14 @@ AVRational VideoDecoder::time_base() const {
   return codec_context_->time_base;
 }
 
-AVRational VideoDecoder::sample_aspect_ratio() const {
-  return codec_context_->sample_aspect_ratio;
+AVRational VideoDecoder::sample_aspect_ratio(const bool reduce) const {
+  AVRational sar = codec_context_->sample_aspect_ratio;
+
+  if (reduce) {
+    av_reduce(&sar.num, &sar.den, sar.num, sar.den, 1024 * 1024);
+  }
+
+  return sar;
 }
 
 AVRational VideoDecoder::display_aspect_ratio() const {

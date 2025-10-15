@@ -2,8 +2,11 @@
 #include <libgen.h>
 #include <algorithm>
 #include <atomic>
+#include <future>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -14,7 +17,6 @@
 #include "format_converter.h"
 #include "png_saver.h"
 #include "source_code_pro_regular_ttf.h"
-#include "string_utils.h"
 #include "version.h"
 #include "video_compare_icon.h"
 #include "vmaf_calculator.h"
@@ -61,12 +63,21 @@ inline T check_sdl(T value, const std::string& message) {
   return value;
 }
 
+template <typename T>
+inline T clamp_range(T v, T lo, T hi) {
+  return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+inline uint32_t clamp_u32(int v, uint32_t hi) {
+  return (v < 0) ? 0u : (v > (int)hi ? hi : (uint32_t)v);
+}
+
 inline int clamp_int_to_byte_range(int value) {
-  return value > 255 ? 255 : value < 0 ? 0 : value;
+  return clamp_range(value, 0, 255);
 }
 
 inline int clamp_int_to_10_bpc_range(int value) {
-  return value > 1023 ? 1023 : value < 0 ? 0 : value;
+  return clamp_range(value, 0, 1023);
 }
 
 inline uint8_t clamp_int_to_byte(int value) {
@@ -76,6 +87,30 @@ inline uint8_t clamp_int_to_byte(int value) {
 inline uint16_t clamp_int_to_10_bpc(int value) {
   return static_cast<uint16_t>(clamp_int_to_10_bpc_range(value));
 }
+
+inline int luma709(int r, int g, int b) {
+  return (217 * r + 733 * g + 74 * b) >> 10;
+}
+
+template <int Bpc>
+struct BitDepthTraits;
+template <>
+struct BitDepthTraits<8> {
+  using P = uint8_t;
+  static constexpr uint32_t MaxCode = 255u;
+  static constexpr int PackShift = 0;          // stored as 8b
+  static inline int to10(int v) { return v; }  // already 8-bit working domain
+  static inline P from10(uint32_t v) { return (P)clamp_u32((int)v, MaxCode); }
+};
+
+template <>
+struct BitDepthTraits<10> {
+  using P = uint16_t;
+  static constexpr uint32_t MaxCode = 1023u;
+  static constexpr int PackShift = 6;          // stored as 16b with <<6
+  static inline int to10(int v) { return v; }  // values in working domain are 10b
+  static inline P from10(uint32_t v) { return (P)(clamp_u32((int)v, MaxCode) << PackShift); }
+};
 
 // Credits to Kemin Zhou for this approach which does not require Boost or C++17
 // https://stackoverflow.com/questions/4430780/how-can-i-extract-the-file-name-and-extension-from-a-path-in-c
@@ -311,6 +346,7 @@ Display::Display(const int display_number,
 
   normal_mode_cursor_ = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
   pan_mode_cursor_ = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZEALL);
+  selection_mode_cursor_ = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_CROSSHAIR);
 
   SDL_RenderSetLogicalSize(renderer_, drawable_width_, drawable_height_);
 
@@ -413,6 +449,7 @@ Display::~Display() {
 
   SDL_FreeCursor(normal_mode_cursor_);
   SDL_FreeCursor(pan_mode_cursor_);
+  SDL_FreeCursor(selection_mode_cursor_);
 
   delete[] diff_buffer_;
 
@@ -479,91 +516,345 @@ void Display::print_verbose_info() {
 }
 
 void Display::convert_to_packed_10_bpc(std::array<uint8_t*, 3> in_planes, std::array<size_t, 3> in_pitches, std::array<uint32_t*, 3> out_planes, std::array<size_t, 3> out_pitches, const SDL_Rect& roi) {
-  uint16_t* p_in = reinterpret_cast<uint16_t*>(in_planes[0] + roi.x * 6 + in_pitches[0] * roi.y);
-  uint32_t* p_out = out_planes[0] + roi.x + out_pitches[0] * roi.y / 4;
+  row_workers_.run_dynamic(
+      roi.h,
+      [=](const int start_row, const int end_row) {
+        uint16_t* p_in = reinterpret_cast<uint16_t*>(in_planes[0] + roi.x * 6 + in_pitches[0] * (roi.y + start_row));
+        uint32_t* p_out = out_planes[0] + roi.x + out_pitches[0] * (roi.y + start_row) / sizeof(uint32_t);
 
-  for (int y = 0; y < roi.h; y++) {
-    for (int in_x = 0, out_x = 0; out_x < roi.w; in_x += 3, out_x++) {
-      const uint32_t r = p_in[in_x] >> 6;
-      const uint32_t g = p_in[in_x + 1] >> 6;
-      const uint32_t b = p_in[in_x + 2] >> 6;
+        for (int y = start_row; y < end_row; y++) {
+          for (int in_x = 0, out_x = 0; out_x < roi.w; in_x += 3, out_x++) {
+            const uint32_t r = p_in[in_x] >> 6;
+            const uint32_t g = p_in[in_x + 1] >> 6;
+            const uint32_t b = p_in[in_x + 2] >> 6;
 
-      p_out[out_x] = (r << 20) | (g << 10) | (b);
+            p_out[out_x] = (r << 20) | (g << 10) | (b);
+          }
+
+          p_in += in_pitches[0] / sizeof(uint16_t);
+          p_out += out_pitches[0] / sizeof(uint32_t);
+        }
+      },
+      suggest_block_rows_by_bytes(roi.w, roi.h, sizeof(uint16_t), 3));
+}
+
+template <int Bpc>
+inline void process_difference_scanline(const typename BitDepthTraits<Bpc>::P* plane_left,
+                                        const typename BitDepthTraits<Bpc>::P* plane_right,
+                                        typename BitDepthTraits<Bpc>::P* plane_difference,
+                                        const int pixels,
+                                        const Display::DiffMode mode,
+                                        const bool luma_only,
+                                        const std::vector<uint32_t>& mag_u,
+                                        const std::vector<uint32_t>& mag_s) {
+  using T = BitDepthTraits<Bpc>;
+  constexpr uint32_t MAX = T::MaxCode;
+  constexpr uint32_t MID = MAX >> 1;
+
+  auto load = [](typename T::P v) -> int { return (int)(v >> T::PackShift); };
+
+  for (int i = 0; i < pixels; i++) {
+    const int idx = i * 3;
+    const int rl = load(plane_left[idx]), gl = load(plane_left[idx + 1]), bl = load(plane_left[idx + 2]);
+    const int rr = load(plane_right[idx]), gr = load(plane_right[idx + 1]), br = load(plane_right[idx + 2]);
+
+    if (mode == Display::DiffMode::LegacyAbs) {
+      // Original: per-channel abs * AMPLIFICATION, clamped to bit depth
+      constexpr int AMPLIFICATION = 2;
+
+      if (luma_only) {
+        const int dl = luma709(rl, gl, bl) - luma709(rr, gr, br);
+        const uint32_t Y = clamp_u32(std::abs(dl) * AMPLIFICATION, MAX);
+        auto y_p = T::from10(Y);
+
+        plane_difference[idx] = y_p;
+        plane_difference[idx + 1] = y_p;
+        plane_difference[idx + 2] = y_p;
+      } else {
+        const uint32_t R = clamp_u32(std::abs(rl - rr) * AMPLIFICATION, MAX);
+        const uint32_t G = clamp_u32(std::abs(gl - gr) * AMPLIFICATION, MAX);
+        const uint32_t B = clamp_u32(std::abs(bl - br) * AMPLIFICATION, MAX);
+
+        plane_difference[idx + 0] = T::from10(R);
+        plane_difference[idx + 1] = T::from10(G);
+        plane_difference[idx + 2] = T::from10(B);
+      }
+      continue;
     }
 
-    p_in += in_pitches[0] / 2;
-    p_out += out_pitches[0] / 4;
+    // Adaptive mapping with optional sign and luma-only
+    if (luma_only) {
+      const int dl = luma709(rl, gl, bl) - luma709(rr, gr, br);
+      const uint32_t a = (uint32_t)std::min<int>(MAX, std::abs(dl));
+
+      if (mode == Display::DiffMode::SignedDiverging) {
+        const uint32_t m = mag_s[a];
+        const uint32_t Y = (dl >= 0) ? (MID + m) : (MID - m);
+        auto y_p = T::from10(Y);
+        plane_difference[idx + 0] = plane_difference[idx + 1] = plane_difference[idx + 2] = y_p;
+      } else {
+        const uint32_t Y = mag_u[a];
+        auto y_p = T::from10(Y);
+        plane_difference[idx + 0] = plane_difference[idx + 1] = plane_difference[idx + 2] = y_p;
+      }
+    } else {
+      const int dr = rl - rr, dg = gl - gr, db = bl - br;
+
+      if (mode == Display::DiffMode::SignedDiverging) {
+        const uint32_t ar = (uint32_t)std::min<int>(MAX, std::abs(dr));
+        const uint32_t ag = (uint32_t)std::min<int>(MAX, std::abs(dg));
+        const uint32_t ab = (uint32_t)std::min<int>(MAX, std::abs(db));
+
+        plane_difference[idx + 0] = T::from10(dr >= 0 ? (MID + mag_s[ar]) : (MID - mag_s[ar]));
+        plane_difference[idx + 1] = T::from10(dg >= 0 ? (MID + mag_s[ag]) : (MID - mag_s[ag]));
+        plane_difference[idx + 2] = T::from10(db >= 0 ? (MID + mag_s[ab]) : (MID - mag_s[ab]));
+      } else {
+        const uint32_t ar = (uint32_t)std::min<int>(MAX, std::abs(dr));
+        const uint32_t ag = (uint32_t)std::min<int>(MAX, std::abs(dg));
+        const uint32_t ab = (uint32_t)std::min<int>(MAX, std::abs(db));
+
+        plane_difference[idx + 0] = T::from10(mag_u[ar]);
+        plane_difference[idx + 1] = T::from10(mag_u[ag]);
+        plane_difference[idx + 2] = T::from10(mag_u[ab]);
+      }
+    }
   }
+}
+
+template <int Bpc>
+float Display::calculate_frame_p99(const typename BitDepthTraits<Bpc>::P* plane_left, const typename BitDepthTraits<Bpc>::P* plane_right, const size_t pitch_left, const size_t pitch_right, const int width_right) const {
+  using T = BitDepthTraits<Bpc>;
+  static_assert(Bpc == 8 || Bpc == 10, "Bpc must be 8 or 10");
+  constexpr int CHANNELS = 3;
+
+  const size_t stride_l = pitch_left / sizeof(typename T::P);
+  const size_t stride_r = pitch_right / sizeof(typename T::P);
+
+  const int bins = static_cast<int>(T::MaxCode) + 1;
+  const int num_threads = row_workers_.size();
+
+  std::vector<std::vector<uint32_t>> thread_histograms(num_threads, std::vector<uint32_t>(bins, 0u));
+
+  // Use RowWorkers to compute histograms for different row ranges
+  auto histograms_ptr = std::make_shared<std::vector<std::vector<uint32_t>>>(std::move(thread_histograms));
+
+  row_workers_.run_dynamic_indexed(
+      video_height_,
+      [=](const int start_row, const int end_row, const int worker_index) {
+        auto& hist = (*histograms_ptr)[worker_index];
+
+        for (int y = start_row; y < end_row; y++) {
+          const typename T::P* row_l = plane_left + y * stride_l;
+          const typename T::P* row_r = plane_right + y * stride_r;
+
+          for (int x = 0; x < width_right; x++) {
+            const int idx = x * CHANNELS;
+
+            const int rl = row_l[idx + 0] >> T::PackShift;
+            const int gl = row_l[idx + 1] >> T::PackShift;
+            const int bl = row_l[idx + 2] >> T::PackShift;
+
+            const int rr = row_r[idx + 0] >> T::PackShift;
+            const int gr = row_r[idx + 1] >> T::PackShift;
+            const int br = row_r[idx + 2] >> T::PackShift;
+
+            int d;
+            if (diff_luma_only_) {
+              const int yl = luma709(rl, gl, bl);
+              const int yr = luma709(rr, gr, br);
+              d = std::abs(yl - yr);
+            } else {
+              const int dr = std::abs(rl - rr);
+              const int dg = std::abs(gl - gr);
+              const int db = std::abs(bl - br);
+              d = dr > dg ? (dr > db ? dr : db) : (dg > db ? dg : db);
+            }
+
+            const int bin = clamp_range(d, 0, bins - 1);
+            hist[static_cast<size_t>(bin)]++;
+          }
+        }
+      },
+      suggest_block_rows_by_bytes(video_width_, video_height_, sizeof(typename BitDepthTraits<Bpc>::P), 3));
+
+  // Merge histograms
+  std::vector<uint32_t> hist(bins, 0u);
+  for (const auto& thread_hist : *histograms_ptr) {
+    for (size_t i = 0; i < bins; ++i) {
+      hist[i] += thread_hist[i];
+    }
+  }
+
+  // Sum of histogram counts
+  uint64_t total = std::accumulate(hist.begin(), hist.end(), 0);
+
+  if (total == 0) {
+    return 1.f;
+  }
+
+  // Linear-interpolated 99th percentile
+  const double target_f = 0.99 * (double)(total - 1);
+  const uint64_t r0 = (uint64_t)std::floor(target_f);
+  const uint64_t r1 = (uint64_t)std::ceil(target_f);
+  const double frac = target_f - (double)r0;
+
+  int v0 = bins - 1, v1 = bins - 1;
+  uint64_t acc = 0;
+
+  // Find the values at ranks r0 and r1
+  for (int k = 0; k < bins; k++) {
+    const uint64_t next = acc + hist[static_cast<size_t>(k)];
+    if (acc <= r0 && r0 < next) {
+      v0 = k;
+    }
+    if (acc <= r1 && r1 < next) {
+      v1 = k;
+      break;
+    }
+    acc = next;
+  }
+
+  const float p = (float)v0 + frac * (float)(v1 - v0);
+  return p;
+}
+
+std::pair<std::vector<uint32_t>, std::vector<uint32_t>> make_diff_lut(uint32_t max_code, Display::DiffMode mode, uint32_t scale_max) {
+  std::vector<uint32_t> mag_u(max_code + 1);
+  std::vector<uint32_t> mag_s(max_code + 1);
+
+  if (mode != Display::DiffMode::LegacyAbs) {
+    if (scale_max == 0) {
+      scale_max = 1;
+    }
+
+    const uint32_t MID = max_code >> 1;
+    const uint32_t Q = 16;
+    const uint32_t ONE_Q = 1u << Q;
+    const uint64_t HALF = uint64_t(1) << (Q - 1);
+
+    for (uint32_t a = 0; a <= max_code; a++) {
+      // x_q = clamp(a/scale, 0..1) in Q16
+      uint32_t x_q = (uint32_t)std::min<uint64_t>(ONE_Q, ((uint64_t)a << Q) / scale_max);
+
+      // map_unit(x): Linear / Sqrt (SignedDiverging uses sqrt magnitude)
+      uint32_t y_q;
+      switch (mode) {
+        case Display::DiffMode::AbsLinear:
+          y_q = x_q;
+          break;
+        case Display::DiffMode::AbsSqrt:
+        case Display::DiffMode::SignedDiverging: {
+          const double x = double(x_q) / double(ONE_Q);
+          const double y = std::sqrt(x);
+          y_q = (uint32_t)std::llround(y * double(ONE_Q));
+          break;
+        }
+        default:  // LegacyAbs not expected here; fall back to linear
+          y_q = x_q;
+          break;
+      }
+
+      // Scale back to code domain with Q16 rounding
+      mag_u[a] = (uint32_t)(((uint64_t)y_q * max_code + HALF) >> Q);  // [0..MAX]
+      mag_s[a] = (uint32_t)(((uint64_t)y_q * MID + HALF) >> Q);       // [0..MID]
+    }
+  }
+
+  return std::pair<std::vector<uint32_t>, std::vector<uint32_t>>(std::move(mag_u), std::move(mag_s));
+};
+
+template <int Bpc>
+void Display::process_difference_planes(const typename BitDepthTraits<Bpc>::P* plane_left0,
+                                        const typename BitDepthTraits<Bpc>::P* plane_right0,
+                                        typename BitDepthTraits<Bpc>::P* plane_difference0,
+                                        const size_t pitch_left,
+                                        const size_t pitch_right,
+                                        const size_t pitch_difference,
+                                        const int width_right,
+                                        const float diff_max) const {
+  using T = BitDepthTraits<Bpc>;
+  constexpr uint32_t MAX = T::MaxCode;
+
+  const float scale_max = (diff_mode_ == Display::DiffMode::LegacyAbs) ? -1.f : clamp_range(diff_max, 4.f, (float)MAX);
+
+  // Integerize/clip scale once
+  const uint32_t scale_max_i = (uint32_t)std::max<double>(1.0, std::min<double>(double(MAX), std::round(std::fabs(scale_max))));
+
+  // Build LUTs (only for adaptive mapping)
+  auto luts = make_diff_lut(MAX, diff_mode_, scale_max_i);
+  const std::vector<uint32_t> mag_u = std::move(luts.first);
+  const std::vector<uint32_t> mag_s = std::move(luts.second);
+
+  row_workers_.run_dynamic(
+      video_height_,
+      [=](const int start_row, const int end_row) {
+        auto plane_left = plane_left0 + start_row * (pitch_left / sizeof(typename T::P));
+        auto plane_right = plane_right0 + start_row * (pitch_right / sizeof(typename T::P));
+        auto plane_difference = plane_difference0 + start_row * (pitch_difference / sizeof(typename T::P));
+
+        for (int y = start_row; y < end_row; y++) {
+          process_difference_scanline<Bpc>(plane_left, plane_right, plane_difference, width_right, diff_mode_, diff_luma_only_, mag_u, mag_s);
+          plane_left += pitch_left / sizeof(typename T::P);
+          plane_right += pitch_right / sizeof(typename T::P);
+          plane_difference += pitch_difference / sizeof(typename T::P);
+        }
+      },
+      suggest_block_rows_by_bytes(video_width_, video_height_, sizeof(typename BitDepthTraits<Bpc>::P), 3));
 }
 
 void Display::update_difference(std::array<uint8_t*, 3> planes_left, std::array<size_t, 3> pitches_left, std::array<uint8_t*, 3> planes_right, std::array<size_t, 3> pitches_right, int split_x) {
-  const int amplification = 2;
+  constexpr int CHANNELS = 3;
 
+  const int width_right = (video_width_ - split_x);
+  if (width_right <= 0) {
+    return;
+  }
+
+  const bool update_frame_max = diff_mode_ != DiffMode::LegacyAbs;
+  float frame_max = 1.f;
+
+  // row starts after split_x pixels, i.e., split_x * 3 samples
   if (use_10_bpc_) {
-    uint16_t* p_left = reinterpret_cast<uint16_t*>(planes_left[0] + split_x * 6);
-    uint16_t* p_right = reinterpret_cast<uint16_t*>(planes_right[0] + split_x * 6);
-    uint16_t* p_diff = reinterpret_cast<uint16_t*>(diff_planes_[0] + split_x * 6);
+    auto plane_left0 = reinterpret_cast<uint16_t*>(planes_left[0]) + split_x * CHANNELS;
+    auto plane_right0 = reinterpret_cast<uint16_t*>(planes_right[0]) + split_x * CHANNELS;
+    auto plane_difference0 = reinterpret_cast<uint16_t*>(diff_planes_[0]) + split_x * CHANNELS;
 
-    for (int y = 0; y < video_height_; y++) {
-      for (int in_x = 0, out_x = 0; out_x < (video_width_ - split_x) * 3; in_x += 3, out_x += 3) {
-        const int rl = p_left[in_x] >> 6;
-        const int gl = p_left[in_x + 1] >> 6;
-        const int bl = p_left[in_x + 2] >> 6;
-
-        const int rr = p_right[in_x] >> 6;
-        const int gr = p_right[in_x + 1] >> 6;
-        const int br = p_right[in_x + 2] >> 6;
-
-        const int r_diff = abs(rl - rr) * amplification;
-        const int g_diff = abs(gl - gr) * amplification;
-        const int b_diff = abs(bl - br) * amplification;
-
-        p_diff[out_x] = clamp_int_to_10_bpc(r_diff) << 6;
-        p_diff[out_x + 1] = clamp_int_to_10_bpc(g_diff) << 6;
-        p_diff[out_x + 2] = clamp_int_to_10_bpc(b_diff) << 6;
-      }
-
-      p_left += pitches_left[0] / sizeof(uint16_t);
-      p_right += pitches_right[0] / sizeof(uint16_t);
-      p_diff += diff_pitches_[0] / sizeof(uint16_t);
+    if (update_frame_max) {
+      frame_max = calculate_frame_p99<10>(plane_left0, plane_right0, pitches_left[0], pitches_right[0], width_right);
     }
+
+    process_difference_planes<10>(plane_left0, plane_right0, plane_difference0, pitches_left[0], pitches_right[0], diff_pitches_[0], width_right, frame_max);
   } else {
-    uint8_t* p_left = planes_left[0] + split_x * 3;
-    uint8_t* p_right = planes_right[0] + split_x * 3;
-    uint8_t* p_diff = diff_planes_[0] + split_x * 3;
+    auto plane_left0 = planes_left[0] + split_x * CHANNELS;
+    auto plane_right0 = planes_right[0] + split_x * CHANNELS;
+    auto plane_difference0 = diff_planes_[0] + split_x * CHANNELS;
 
-    for (int y = 0; y < video_height_; y++) {
-      for (int in_x = 0, out_x = 0; out_x < (video_width_ - split_x) * 3; in_x += 3, out_x += 3) {
-        const int rl = p_left[in_x];
-        const int gl = p_left[in_x + 1];
-        const int bl = p_left[in_x + 2];
-
-        const int rr = p_right[in_x];
-        const int gr = p_right[in_x + 1];
-        const int br = p_right[in_x + 2];
-
-        const int r_diff = abs(rl - rr) * amplification;
-        const int g_diff = abs(gl - gr) * amplification;
-        const int b_diff = abs(bl - br) * amplification;
-
-        p_diff[out_x] = clamp_int_to_byte(r_diff);
-        p_diff[out_x + 1] = clamp_int_to_byte(g_diff);
-        p_diff[out_x + 2] = clamp_int_to_byte(b_diff);
-      }
-
-      p_left += pitches_left[0];
-      p_right += pitches_right[0];
-      p_diff += diff_pitches_[0];
+    if (update_frame_max) {
+      frame_max = calculate_frame_p99<8>(plane_left0, plane_right0, pitches_left[0], pitches_right[0], width_right);
     }
+
+    process_difference_planes<8>(plane_left0, plane_right0, plane_difference0, pitches_left[0], pitches_right[0], diff_pitches_[0], width_right, frame_max);
   }
 }
+
+void write_png(const AVFrame* frame, const std::string& filename, std::atomic_bool& error_occurred) {
+  try {
+    PngSaver::save(frame, filename);
+  } catch (const PngSaver::IOException& e) {
+    std::cerr << "Error saving video PNG image to file: " << filename << std::endl;
+    error_occurred = true;
+  } catch (const std::runtime_error& e) {
+    std::cerr << "Unexpected while error saving PNG: " << e.what() << std::endl;
+    error_occurred = true;
+  }
+};
 
 void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_frame) {
   std::atomic_bool error_occurred(false);
 
   const auto create_onscreen_display_avframe = [&]() -> AVFramePtr {
     const size_t pitch = use_10_bpc_ ? drawable_width_ * 3 * sizeof(uint16_t) : drawable_width_ * 3;
-    uint8_t* pixels = new uint8_t[pitch * drawable_height_];
+    uint8_t* pixels = reinterpret_cast<uint8_t*>(av_malloc(pitch * drawable_height_));
 
     if (use_10_bpc_) {
       const size_t temp_pitch = drawable_width_ * sizeof(uint32_t);
@@ -600,25 +891,15 @@ void Display::save_image_frames(const AVFrame* left_frame, const AVFrame* right_
 
   const auto osd_frame = create_onscreen_display_avframe();
 
-  const auto write_png = [this, &error_occurred](const AVFrame* frame, const std::string& filename) {
-    try {
-      PngSaver::save(frame, filename);
-    } catch (const PngSaver::IOException& e) {
-      std::cerr << "Error saving video PNG image to file: " << filename << std::endl;
-      error_occurred = true;
-    } catch (const std::runtime_error& e) {
-      std::cerr << "Unexpected while error saving PNG: " << e.what() << std::endl;
-      error_occurred = true;
-    }
-  };
-
   const std::string left_filename = string_sprintf("%s%s_%04d.png", left_file_stem_.c_str(), (left_file_stem_ == right_file_stem_) ? "_left" : "", saved_image_number_);
   const std::string right_filename = string_sprintf("%s%s_%04d.png", right_file_stem_.c_str(), (left_file_stem_ == right_file_stem_) ? "_right" : "", saved_image_number_);
   const std::string osd_filename = string_sprintf("%s_%s_osd_%04d.png", left_file_stem_.c_str(), right_file_stem_.c_str(), saved_image_number_);
 
-  std::thread save_left_frame_thread(write_png, left_frame, left_filename);
-  std::thread save_right_frame_thread(write_png, right_frame, right_filename);
-  std::thread save_osd_frame_thread(write_png, osd_frame.get(), osd_filename);
+  auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return write_png(frame, filename, error_occurred); };
+
+  std::thread save_left_frame_thread(save_frame, left_frame, left_filename);
+  std::thread save_right_frame_thread(save_frame, right_frame, right_filename);
+  std::thread save_osd_frame_thread(save_frame, osd_frame.get(), osd_filename);
 
   save_left_frame_thread.join();
   save_right_frame_thread.join();
@@ -966,6 +1247,327 @@ void Display::render_help() {
   }
 }
 
+void Display::render_metadata_overlay() {
+  // Check if swap state has changed and refresh metadata if needed
+  if (swap_left_right_ != last_swap_left_right_state_) {
+    last_swap_left_right_state_ = swap_left_right_;
+    update_metadata(right_metadata_, left_metadata_);
+  }
+
+  SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+  SDL_SetRenderDrawColor(renderer_, 0, 0, 0, BACKGROUND_ALPHA * 3 / 2);
+  SDL_RenderFillRect(renderer_, nullptr);
+
+  const int table_width = drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2;
+  const int table_x = HELP_TEXT_HORIZONTAL_MARGIN;
+
+  // Calculate the starting Y position to center the table vertically
+  int y;
+
+  if (mode_ == Mode::VSTACK && metadata_total_height_ < drawable_height_ / 2) {
+    y = (drawable_height_ / 2 - metadata_total_height_) / 2;
+  } else if (mode_ != Mode::VSTACK && metadata_total_height_ < drawable_height_) {
+    y = (drawable_height_ - metadata_total_height_) / 2;
+  } else {
+    y = metadata_y_offset_ + 10;
+  }
+
+  for (size_t i = 0; i < metadata_textures_.size(); i++) {
+    int w, h;
+    SDL_QueryTexture(metadata_textures_[i], nullptr, nullptr, &w, &h);
+
+    int x_offset = (table_width - w) / 2;
+
+    SDL_Rect screen_area = {table_x + x_offset, y, w, h};
+    SDL_RenderCopy(renderer_, metadata_textures_[i], nullptr, &screen_area);
+
+    y += h + HELP_TEXT_LINE_SPACING;
+  }
+}
+
+void Display::update_metadata(const VideoMetadata left_metadata, const VideoMetadata right_metadata) {
+  // Store the metadata for later use when swapping
+  left_metadata_ = left_metadata;
+  right_metadata_ = right_metadata;
+
+  constexpr char TOKENIZER = ',';
+
+  for (auto texture : metadata_textures_) {
+    SDL_DestroyTexture(texture);
+  }
+  metadata_textures_.clear();
+  metadata_total_height_ = 0;
+
+  auto add_metadata_texture = [&](TTF_Font* font, const std::string& text, bool primary_color, bool is_header) {
+    int h;
+
+    // choose text color based on content type and alternating pattern
+    SDL_Color text_color = is_header ? HELP_TEXT_PRIMARY_COLOR : (primary_color ? HELP_TEXT_PRIMARY_COLOR : HELP_TEXT_ALTERNATE_COLOR);
+
+    // render text with word wrapping to fit available width
+    SDL_Surface* surface = TTF_RenderUTF8_Blended_Wrapped(font, text.c_str(), text_color, drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2);
+    SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer_, surface);
+    SDL_FreeSurface(surface);
+
+    // get texture dimensions and accumulate total height for scrolling calculations
+    SDL_QueryTexture(texture, nullptr, nullptr, nullptr, &h);
+    metadata_total_height_ += h + HELP_TEXT_LINE_SPACING;
+
+    metadata_textures_.push_back(texture);
+  };
+
+  // Calculate max length for column sizing
+  auto calculate_max_length = [](const VideoMetadata& metadata) -> size_t {
+    size_t max_length = 0;
+    for (const auto& kv : metadata.properties) {
+      // comma tokenize value and find max length among all tokens
+      std::vector<std::string> tokens = string_split(kv.second, TOKENIZER);
+      for (const auto& token : tokens) {
+        max_length = std::max(max_length, token.length());
+      }
+    }
+    return max_length;
+  };
+
+  auto left_max_length = calculate_max_length(left_metadata);
+  auto right_max_length = calculate_max_length(right_metadata);
+
+  const std::vector<std::string> properties(MetadataProperties::ALL, MetadataProperties::ALL + MetadataProperties::COUNT);
+
+  // calculate available display width (accounting for margins)
+  const int available_width = drawable_width_ - HELP_TEXT_HORIZONTAL_MARGIN * 2;
+
+  // dynamic column width calculation
+  constexpr int spacing = 2;
+
+  // calculate initial column widths based on content
+  int prop_cols = MetadataProperties::LONGEST + spacing;
+  int left_cols = left_max_length + spacing;
+  int right_cols = right_max_length + spacing;
+  int total_cols = prop_cols + left_cols + right_cols;
+
+  // determine character widths for both font sizes to choose optimal font
+  const std::string test_text = "FOR COMPUTING THE AVERAGE CHARACTER WIDTHS, WE NEED TO TEST THE WIDTH OF A STRING";
+
+  int char_width_small = 10;
+  int char_width_big = 14;
+
+  int text_width, text_height;
+
+  if (TTF_SizeText(small_font_, test_text.c_str(), &text_width, &text_height) == 0) {
+    char_width_small = text_width / test_text.length() + 1;
+  }
+  if (TTF_SizeText(big_font_, test_text.c_str(), &text_width, &text_height) == 0) {
+    char_width_big = text_width / test_text.length() + 1;
+  }
+
+  // calculate how many characters can fit per line with each font
+  const int max_cols_per_line_big = available_width / char_width_big;
+  const int max_cols_per_line_small = available_width / char_width_small;
+
+  // choose the largest font that can accommodate all columns
+  const int char_width = max_cols_per_line_big >= total_cols ? char_width_big : char_width_small;
+  auto font = max_cols_per_line_big >= total_cols ? big_font_ : small_font_;
+
+  const int max_cols_per_line = available_width / char_width;
+
+  // if content is too wide for the window, proportionally reduce column widths
+  if (total_cols > max_cols_per_line) {
+    const int overshoot = total_cols - max_cols_per_line;
+
+    // distribute the overshoot proportionally across columns
+    // property column gets priority (2x weight) since it's the least important
+    const int prop_cols_overshoot = std::min(prop_cols, overshoot * prop_cols / total_cols * 2);
+    const int left_cols_overshoot = std::max(0, overshoot - prop_cols_overshoot) * left_cols / (left_cols + right_cols);
+    const int right_cols_overshoot = overshoot - prop_cols_overshoot - left_cols_overshoot;
+
+    prop_cols -= prop_cols_overshoot;
+    left_cols -= left_cols_overshoot;
+    right_cols -= right_cols_overshoot;
+  }
+
+  // generate table header
+  TTF_SetFontStyle(font, TTF_STYLE_ITALIC | TTF_STYLE_UNDERLINE);
+  add_metadata_texture(font, string_sprintf("%-*s%-*s%-*s", prop_cols, "", left_cols, "LEFT", right_cols, "RIGHT"), true, false);
+  TTF_SetFontStyle(font, TTF_STYLE_NORMAL);
+
+  bool primary_color = false;
+
+  for (const auto& prop : properties) {
+    std::string prop_value = to_upper_case(prop);
+
+    // extract values for both videos
+    std::string left_value = left_metadata.get(prop);
+    std::string right_value = right_metadata.get(prop);
+
+    // tokenize values by comma
+    std::vector<std::string> left_tokens = string_split(left_value, TOKENIZER);
+    std::vector<std::string> right_tokens = string_split(right_value, TOKENIZER);
+
+    // determine how many lines we need for this property
+    size_t max_tokens = std::max(left_tokens.size(), right_tokens.size());
+
+    for (size_t i = 0; i < max_tokens; i++) {
+      std::string current_prop_value = (i == 0) ? prop_value : "";
+      std::string current_left_value = (i < left_tokens.size()) ? left_tokens[i] : "";
+      std::string current_right_value = (i < right_tokens.size()) ? right_tokens[i] : "";
+
+      // text truncation for narrow columns
+      if (static_cast<int>(current_prop_value.length()) >= prop_cols) {
+        current_prop_value = prop_cols > 1 ? current_prop_value.substr(0, prop_cols - 2) + "… " : "";
+      }
+      if (static_cast<int>(current_left_value.length()) >= left_cols) {
+        current_left_value = "…" + current_left_value.substr(current_left_value.length() - left_cols + 2) + " ";
+      }
+      if (static_cast<int>(current_right_value.length()) >= right_cols) {
+        current_right_value = "…" + current_right_value.substr(current_right_value.length() - right_cols + 2) + " ";
+      }
+
+      add_metadata_texture(font, string_sprintf("%-*s%-*s%-*s", prop_cols, current_prop_value.c_str(), left_cols, current_left_value.c_str(), right_cols, current_right_value.c_str()), primary_color, false);
+
+      primary_color = !primary_color;
+    }
+  }
+}
+
+SDL_Rect Display::get_left_selection_rect() const {
+  const int x = std::min(selection_start_.x(), selection_end_.x());
+  const int y = std::min(selection_start_.y(), selection_end_.y());
+  const int w = std::abs(selection_end_.x() - selection_start_.x());
+  const int h = std::abs(selection_end_.y() - selection_start_.y());
+
+  const int clipped_x = std::max(0, x);
+  const int clipped_y = std::max(0, y);
+  const int clipped_w = std::min(w - (clipped_x - x), video_width_ - clipped_x);
+  const int clipped_h = std::min(h - (clipped_y - y), video_height_ - clipped_y);
+
+  return {clipped_x, clipped_y, clipped_w, clipped_h};
+}
+
+void Display::draw_selection_rect() {
+  if (selection_state_ != SelectionState::STARTED) {
+    return;
+  }
+
+  const auto zoom_rect = compute_zoom_rect();
+
+  auto draw_rect = [this](const SDL_FRect& r, Uint8 r_val, Uint8 g_val, Uint8 b_val) {
+    // Draw semi-transparent overlay
+    SDL_SetRenderDrawColor(renderer_, r_val / 2, g_val / 2, b_val / 2, 128);
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+    SDL_RenderFillRectF(renderer_, &r);
+
+    // Draw border
+    SDL_SetRenderDrawColor(renderer_, r_val, g_val, b_val, 255);
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_NONE);
+    SDL_RenderDrawRectF(renderer_, &r);
+  };
+
+  SDL_Rect selection_rect = get_left_selection_rect();
+  SDL_FRect drawable_rect = video_rect_to_drawable_transform(video_to_zoom_space(selection_rect, zoom_rect));
+
+  if (mode_ == Mode::SPLIT) {
+    // For split mode, we don't need to draw a second rectangle
+    draw_rect(drawable_rect, 255, 255, 255);
+    return;
+  } else {
+    draw_rect(drawable_rect, 255, 128, 128);
+  }
+
+  // Draw right rectangle with appropriate offset
+  switch (mode_) {
+    case Mode::HSTACK:
+      selection_rect.x += video_width_;
+      break;
+    case Mode::VSTACK:
+      selection_rect.y += video_height_;
+      break;
+    default:
+      break;
+  }
+
+  drawable_rect = video_rect_to_drawable_transform(video_to_zoom_space(selection_rect, zoom_rect));
+  draw_rect(drawable_rect, 128, 128, 255);
+}
+
+void Display::possibly_save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame) {
+  if (selection_state_ != SelectionState::COMPLETED) {
+    return;
+  }
+
+  const SDL_Rect selection_rect = get_left_selection_rect();
+
+  if (selection_rect.w <= 0 || selection_rect.h <= 0) {
+    std::cerr << "Selection rectangle is empty. Please make a valid selection." << std::endl;
+  } else {
+    save_selected_area(left_frame, right_frame, selection_rect);
+  }
+
+  selection_state_ = SelectionState::NONE;
+  save_selected_area_ = false;
+}
+
+void Display::save_selected_area(const AVFrame* left_frame, const AVFrame* right_frame, const SDL_Rect& selection_rect) {
+  std::atomic_bool error_occurred(false);
+
+  // Lambda for creating and initializing frames
+  auto create_frame = [&](const int width, const int height, const AVFrame* source_frame) -> AVFrame* {
+    AVFrame* frame = av_frame_alloc();
+    frame->format = source_frame->format;
+    frame->width = width;
+    frame->height = height;
+    frame->colorspace = source_frame->colorspace;
+    frame->color_range = source_frame->color_range;
+    av_frame_get_buffer(frame, 0);
+    return frame;
+  };
+
+  AVFrame* left_selected = create_frame(selection_rect.w, selection_rect.h, left_frame);
+  AVFrame* right_selected = create_frame(selection_rect.w, selection_rect.h, right_frame);
+  AVFrame* concatenated = create_frame(selection_rect.w * 2, selection_rect.h, left_frame);
+
+  const int pixel_size = use_10_bpc_ ? 3 * sizeof(uint16_t) : 3;
+
+  for (int y = 0; y < selection_rect.h; y++) {
+    const int src_y = selection_rect.y + y;
+    const int dst_y = y;
+
+    // Copy left frame data
+    memcpy(left_selected->data[0] + dst_y * left_selected->linesize[0], left_frame->data[0] + src_y * left_frame->linesize[0] + selection_rect.x * pixel_size, selection_rect.w * pixel_size);
+
+    // Copy right frame data
+    memcpy(right_selected->data[0] + dst_y * right_selected->linesize[0], right_frame->data[0] + src_y * right_frame->linesize[0] + selection_rect.x * pixel_size, selection_rect.w * pixel_size);
+
+    // Copy to concatenated frame
+    memcpy(concatenated->data[0] + dst_y * concatenated->linesize[0], left_frame->data[0] + src_y * left_frame->linesize[0] + selection_rect.x * pixel_size, selection_rect.w * pixel_size);
+    memcpy(concatenated->data[0] + dst_y * concatenated->linesize[0] + selection_rect.w * pixel_size, right_frame->data[0] + src_y * right_frame->linesize[0] + selection_rect.x * pixel_size, selection_rect.w * pixel_size);
+  }
+
+  const std::string left_filename = string_sprintf("%s%s_cutout_%04d.png", left_file_stem_.c_str(), (left_file_stem_ == right_file_stem_) ? "_left" : "", saved_selected_image_number_);
+  const std::string right_filename = string_sprintf("%s%s_cutout_%04d.png", right_file_stem_.c_str(), (left_file_stem_ == right_file_stem_) ? "_right" : "", saved_selected_image_number_);
+  const std::string concatenated_filename = string_sprintf("%s_%s_cutout_concat_%04d.png", left_file_stem_.c_str(), right_file_stem_.c_str(), saved_selected_image_number_);
+
+  auto save_frame = [&](const AVFrame* frame, const std::string& filename) { return write_png(frame, filename, error_occurred); };
+
+  std::thread save_left_thread(save_frame, left_selected, left_filename);
+  std::thread save_right_thread(save_frame, right_selected, right_filename);
+  std::thread save_concatenated_thread(save_frame, concatenated, concatenated_filename);
+
+  save_left_thread.join();
+  save_right_thread.join();
+  save_concatenated_thread.join();
+
+  av_frame_free(&left_selected);
+  av_frame_free(&right_selected);
+  av_frame_free(&concatenated);
+
+  if (!error_occurred) {
+    std::cout << "Saved " << string_sprintf("%s, %s and %s", left_filename.c_str(), right_filename.c_str(), concatenated_filename.c_str()) << std::endl;
+
+    saved_selected_image_number_++;
+  }
+}
+
 bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_frame, const std::string& current_total_browsable, const std::string& message) {
   const bool has_updated_left_pts = previous_left_frame_pts_ != left_frame->pts;
   const bool has_updated_right_pts = previous_right_frame_pts_ != right_frame->pts;
@@ -993,13 +1595,11 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
   const bool compare_mode = show_left_ && show_right_;
 
-  const Vector2D video_extent(video_width_, video_height_);
-  const Vector2D zoom_rect_start((global_center_ - global_zoom_factor_ * 0.5F) * video_extent);
-  const Vector2D zoom_rect_end((global_center_ + global_zoom_factor_ * 0.5F) * video_extent);
-  const Vector2D zoom_rect_size(zoom_rect_end - zoom_rect_start);
+  const auto zoom_rect = compute_zoom_rect();
 
-  const int mouse_video_x = std::floor((static_cast<float>(mouse_x_) * video_to_window_width_factor_ - zoom_rect_start.x()) * static_cast<float>(video_width_) / zoom_rect_size.x());
-  const int mouse_video_y = std::floor((static_cast<float>(mouse_y_) * video_to_window_height_factor_ - zoom_rect_start.y()) * static_cast<float>(video_height_) / zoom_rect_size.y());
+  const Vector2D mouse_video_pos = get_mouse_video_position(mouse_x_, mouse_y_, zoom_rect);
+  const int mouse_video_x = mouse_video_pos.x();
+  const int mouse_video_y = mouse_video_pos.y();
 
   // print pixel position in original video coordinates and RGB+YUV color value
   if (print_mouse_position_and_color_) {
@@ -1066,24 +1666,18 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   const float full_ws_mouse_video_x = static_cast<float>(mouse_x_ * window_width_ / (window_width_ - 1)) * video_to_window_width_factor_;
 
   // mouse x-position in video coordinates
-  const float video_mouse_x = (full_ws_mouse_video_x - zoom_rect_start.x()) * static_cast<float>(video_width_) / zoom_rect_size.x();
+  const float video_mouse_x = (full_ws_mouse_video_x - zoom_rect.start.x()) * static_cast<float>(video_width_) / zoom_rect.size.x();
 
   // the nearest texel border to the mouse x-position in window coordinates
-  const float video_texel_clamped_mouse_x = (std::round(video_mouse_x) * zoom_rect_size.x() / static_cast<float>(video_width_) + zoom_rect_start.x()) / video_to_window_width_factor_;
+  const float video_texel_clamped_mouse_x = (std::round(video_mouse_x) * zoom_rect.size.x() / static_cast<float>(video_width_) + zoom_rect.start.x()) / video_to_window_width_factor_;
 
   if (show_left_ || show_right_) {
-    const int split_x = (compare_mode && mode_ == Mode::SPLIT) ? std::min(std::max(std::round(video_mouse_x), 0.0F), float(video_width_)) : show_left_ ? video_width_ : 0;
-
-    // transform video coordinates to the currently zoomed area space
-    auto video_to_zoom_space = [this, zoom_rect_start, zoom_rect_size](const SDL_Rect& video_rect) {
-      return SDL_FRect({zoom_rect_start.x() + float(video_rect.x) * global_zoom_factor_, zoom_rect_start.y() + float(video_rect.y) * global_zoom_factor_, std::min(float(video_rect.w) * global_zoom_factor_, zoom_rect_size.x()),
-                        std::min(float(video_rect.h) * global_zoom_factor_, zoom_rect_size.y())});
-    };
+    const int split_x = (compare_mode && mode_ == Mode::SPLIT) ? clamp_range(std::round(video_mouse_x), 0.0F, float(video_width_)) : show_left_ ? video_width_ : 0;
 
     // update video
     if (show_left_ && (split_x > 0)) {
       const SDL_Rect tex_render_quad_left = {0, 0, split_x, video_height_};
-      const SDL_FRect screen_render_quad_left = video_rect_to_drawable_transform(video_to_zoom_space(tex_render_quad_left));
+      const SDL_FRect screen_render_quad_left = video_rect_to_drawable_transform(video_to_zoom_space(tex_render_quad_left, zoom_rect));
 
       if (input_received_ || has_updated_left_pts) {
         if (use_10_bpc_) {
@@ -1104,7 +1698,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
 
       const SDL_Rect tex_render_quad_right = {right_x_offset + start_right, right_y_offset, (video_width_ - start_right), video_height_};
       const SDL_Rect roi = {start_right, 0, (video_width_ - start_right), video_height_};
-      const SDL_FRect screen_render_quad_right = video_rect_to_drawable_transform(video_to_zoom_space(tex_render_quad_right));
+      const SDL_FRect screen_render_quad_right = video_rect_to_drawable_transform(video_to_zoom_space(tex_render_quad_right, zoom_rect));
 
       if (input_received_ || has_updated_right_pts) {
         if (subtraction_mode_) {
@@ -1143,7 +1737,7 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     const int src_zoomed_size = 64;
     const int src_half_zoomed_size = src_zoomed_size / 2;
 
-    SDL_Rect src_zoomed_area = {std::min(std::max(0, mouse_drawable_x - src_half_zoomed_size), drawable_width_ - src_zoomed_size - 1), std::min(std::max(0, mouse_drawable_y - src_half_zoomed_size), drawable_height_ - src_zoomed_size - 1),
+    SDL_Rect src_zoomed_area = {clamp_range(mouse_drawable_x - src_half_zoomed_size, 0, drawable_width_ - src_zoomed_size - 1), clamp_range(mouse_drawable_y - src_half_zoomed_size, 0, drawable_height_ - src_zoomed_size - 1),
                                 src_zoomed_size, src_zoomed_size};
 
     SDL_Surface* render_surface = SDL_CreateRGBSurface(0, src_zoomed_size, src_zoomed_size, 32, 0, 0, 0, 0);
@@ -1409,6 +2003,12 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
     }
   }
 
+  draw_selection_rect();
+
+  if (show_metadata_) {
+    render_metadata_overlay();
+  }
+
   if (show_help_) {
     render_help();
   }
@@ -1416,6 +2016,10 @@ bool Display::possibly_refresh(const AVFrame* left_frame, const AVFrame* right_f
   if (save_image_frames_) {
     save_image_frames(left_frame, right_frame);
     save_image_frames_ = false;
+  }
+
+  if (save_selected_area_) {
+    possibly_save_selected_area(left_frame, right_frame);
   }
 
   SDL_RenderPresent(renderer_);
@@ -1460,6 +2064,27 @@ void Display::update_move_offset(const Vector2D& move_offset) {
   global_center_ = Vector2D(move_offset_.x() / video_width_ + 0.5F, move_offset_.y() / video_height_ + 0.5F);
 }
 
+Display::ZoomRect Display::compute_zoom_rect() const {
+  const Vector2D video_extent(video_width_, video_height_);
+  const Vector2D zoom_rect_start((global_center_ - global_zoom_factor_ * 0.5F) * video_extent);
+  const Vector2D zoom_rect_end((global_center_ + global_zoom_factor_ * 0.5F) * video_extent);
+  const Vector2D zoom_rect_size(zoom_rect_end - zoom_rect_start);
+  return {zoom_rect_start, zoom_rect_end, zoom_rect_size, global_zoom_factor_};
+}
+
+Vector2D Display::get_mouse_video_position(const int mouse_x, const int mouse_y, const Display::ZoomRect& zoom_rect) const {
+  const int mouse_video_x = std::floor((static_cast<float>(mouse_x) * video_to_window_width_factor_ - zoom_rect.start.x()) * static_cast<float>(video_width_) / zoom_rect.size.x());
+  const int mouse_video_y = std::floor((static_cast<float>(mouse_y) * video_to_window_height_factor_ - zoom_rect.start.y()) * static_cast<float>(video_height_) / zoom_rect.size.y());
+
+  return Vector2D(mouse_video_x, mouse_video_y);
+}
+
+SDL_FRect Display::video_to_zoom_space(const SDL_Rect& video_rect, const Display::ZoomRect& zoom_rect) {
+  // transform video coordinates to the currently zoomed area space
+  return SDL_FRect({zoom_rect.start.x() + float(video_rect.x) * zoom_rect.zoom_factor, zoom_rect.start.y() + float(video_rect.y) * zoom_rect.zoom_factor, std::min(float(video_rect.w) * zoom_rect.zoom_factor, zoom_rect.size.x()),
+                    std::min(float(video_rect.h) * zoom_rect.zoom_factor, zoom_rect.size.y())});
+};
+
 void Display::update_playback_speed(const int playback_speed_level) {
   // allow 128x change of playback speed
   if (abs(playback_speed_level) <= (PLAYBACK_SPEED_KEY_PRESSES_TO_DOUBLE * 7)) {
@@ -1479,6 +2104,49 @@ void Display::input() {
 
   while (SDL_PollEvent(&event_) != 0) {
     input_received_ = true;
+    const SDL_Keymod keymod = SDL_GetModState();
+    const SDL_Keycode keycode = event_.key.keysym.sym;
+
+    auto is_clipboard_mod_pressed = [keymod]() -> bool {
+#ifdef __APPLE__
+      return (keymod & KMOD_GUI);
+#else
+      return (keymod & KMOD_CTRL);
+#endif
+    };
+
+    auto update_cursor = [&]() {
+      SDL_Cursor* cursor;
+
+      if (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_RMASK) {
+        cursor = pan_mode_cursor_;
+      } else if (save_selected_area_ && selection_state_ != SelectionState::COMPLETED) {
+        cursor = selection_mode_cursor_;
+      } else {
+        cursor = normal_mode_cursor_;
+      }
+
+      SDL_SetCursor(cursor);
+    };
+
+    auto wrap_to_left_frame = [&](Vector2D& video_position) -> Vector2D {
+      switch (mode_) {
+        case Mode::HSTACK:
+          return video_position - Vector2D(video_width_, 0);
+        case Mode::VSTACK:
+          return video_position - Vector2D(0, video_height_);
+        default:
+          break;
+      }
+
+      return video_position;
+    };
+
+    auto handle_scroll = [&](int& y_offset, const int total_height, std::vector<SDL_Texture*>& textures) {
+      y_offset += (-event_.motion.yrel * total_height * 3) / drawable_height_;
+      y_offset = std::max(y_offset, drawable_height_ - total_height - static_cast<int>(textures.size()) * HELP_TEXT_LINE_SPACING);
+      y_offset = std::min(y_offset, 0);
+    };
 
     switch (event_.type) {
       case SDL_WINDOWEVENT:
@@ -1514,33 +2182,55 @@ void Display::input() {
       case SDL_MOUSEMOTION:
         SDL_GetMouseState(&mouse_x_, &mouse_y_);
 
+        if (selection_state_ == SelectionState::STARTED) {
+          selection_end_ = get_mouse_video_position(mouse_x_, mouse_y_, compute_zoom_rect());
+
+          if (selection_wrap_) {
+            selection_end_ = wrap_to_left_frame(selection_end_);
+          }
+        }
+
         if (event_.motion.state & SDL_BUTTON_RMASK) {
           const auto pan_offset = Vector2D(event_.motion.xrel, event_.motion.yrel) * Vector2D(video_to_window_width_factor_, video_to_window_height_factor_) / Vector2D(drawable_to_window_width_factor_, drawable_to_window_height_factor_);
 
           update_move_offset(move_offset_ + pan_offset);
         }
 
+        if (show_metadata_) {
+          handle_scroll(metadata_y_offset_, metadata_total_height_, metadata_textures_);
+        }
+
         if (show_help_) {
-          help_y_offset_ += (-event_.motion.yrel * help_total_height_ * 3) / drawable_height_;
-          help_y_offset_ = std::max(help_y_offset_, drawable_height_ - help_total_height_ - static_cast<int>(help_textures_.size()) * HELP_TEXT_LINE_SPACING);
-          help_y_offset_ = std::min(help_y_offset_, 0);
+          handle_scroll(help_y_offset_, help_total_height_, help_textures_);
         }
         break;
       case SDL_MOUSEBUTTONDOWN:
-        if (event_.button.button == SDL_BUTTON_RIGHT) {
-          SDL_SetCursor(pan_mode_cursor_);
-        } else {
+        if (event_.button.button == SDL_BUTTON_LEFT && save_selected_area_ && selection_state_ == SelectionState::NONE) {
+          selection_state_ = SelectionState::STARTED;
+          selection_start_ = get_mouse_video_position(mouse_x_, mouse_y_, compute_zoom_rect());
+
+          // Check if the selection is outside the left video frame
+          selection_wrap_ = (mode_ == Mode::HSTACK && selection_start_.x() >= video_width_) || (mode_ == Mode::VSTACK && selection_start_.y() >= video_height_);
+
+          if (selection_wrap_) {
+            selection_start_ = wrap_to_left_frame(selection_start_);
+          }
+
+          selection_end_ = selection_start_;
+        } else if (event_.button.button != SDL_BUTTON_RIGHT) {
           seek_relative_ = static_cast<float>(mouse_x_) / static_cast<float>(window_width_);
           seek_from_start_ = true;
         }
+        update_cursor();
         break;
       case SDL_MOUSEBUTTONUP:
-        if (event_.button.button == SDL_BUTTON_RIGHT) {
-          SDL_SetCursor(normal_mode_cursor_);
+        if (event_.button.button == SDL_BUTTON_LEFT && selection_state_ == SelectionState::STARTED) {
+          selection_state_ = SelectionState::COMPLETED;
         }
+        update_cursor();
         break;
       case SDL_KEYDOWN:
-        switch (event_.key.keysym.sym) {
+        switch (keycode) {
           case SDLK_h:
             show_help_ = !show_help_;
             break;
@@ -1578,18 +2268,57 @@ void Display::input() {
           case SDLK_z:
             zoom_left_ = true;
             break;
-          case SDLK_c:
-            zoom_right_ = true;
+          case SDLK_c: {
+            if (is_clipboard_mod_pressed()) {
+              const float previous_left_frame_secs = previous_left_frame_pts_ * AV_TIME_TO_SEC;
+              const std::string previous_left_frame_secs_str = format_position(previous_left_frame_secs, false);
+
+              SDL_SetClipboardText(previous_left_frame_secs_str.c_str());
+
+              std::cout << "Copied to clipboard: " << previous_left_frame_secs_str << std::endl;
+            } else {
+              zoom_right_ = true;
+            }
             break;
+          }
+          case SDLK_v: {
+            if (is_clipboard_mod_pressed()) {
+              char* clip_text = SDL_GetClipboardText();
+
+              if (!clip_text) {
+                std::cerr << "Failed to get clipboard text: " << SDL_GetError() << std::endl;
+                return;
+              }
+
+              std::string clipboard_str(clip_text);
+              SDL_free(clip_text);
+
+              static const std::regex timestamp_regex(R"((?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?))");
+              std::smatch match;
+
+              if (std::regex_search(clipboard_str, match, timestamp_regex)) {
+                std::string timestamp = match.str();
+                std::cout << "Timestamp pasted: " << timestamp << std::endl;
+
+                seek_relative_ = parse_timestamps_to_seconds(timestamp) / static_cast<float>(duration_);
+                seek_from_start_ = true;
+              } else {
+                std::cout << "No valid timestamp found in clipboard." << std::endl;
+              }
+            } else {
+              show_metadata_ = !show_metadata_;
+            }
+            break;
+          }
           case SDLK_a:
-            if (event_.key.keysym.mod & KMOD_SHIFT) {
+            if (keymod & KMOD_SHIFT) {
               std::cerr << "Frame-accurate backward navigation has not yet been implemented" << std::endl;
             } else {
               frame_buffer_offset_delta_++;
             }
             break;
           case SDLK_d:
-            if (event_.key.keysym.mod & KMOD_SHIFT) {
+            if (keymod & KMOD_SHIFT) {
               frame_navigation_delta_++;
             } else {
               frame_buffer_offset_delta_--;
@@ -1620,7 +2349,17 @@ void Display::input() {
             break;
           }
           case SDLK_f:
-            save_image_frames_ = true;
+            if (keymod & KMOD_SHIFT) {
+              if (!save_selected_area_) {
+                save_selected_area_ = true;
+              } else {
+                save_selected_area_ = false;
+                selection_state_ = SelectionState::NONE;
+              }
+              update_cursor();
+            } else {
+              save_image_frames_ = true;
+            }
             break;
           case SDLK_p:
             print_mouse_position_and_color_ = mouse_is_inside_window_;
@@ -1689,9 +2428,9 @@ void Display::input() {
           case SDLK_PLUS:
           case SDLK_KP_PLUS:
           case SDLK_EQUALS:  // for tenkeyless keyboards
-            if (event_.key.keysym.mod & KMOD_ALT) {
+            if (keymod & KMOD_ALT) {
               shift_right_frames_ += 100;
-            } else if (event_.key.keysym.mod & KMOD_CTRL) {
+            } else if (keymod & KMOD_CTRL) {
               shift_right_frames_ += 10;
             } else {
               shift_right_frames_++;
@@ -1699,20 +2438,57 @@ void Display::input() {
             break;
           case SDLK_MINUS:
           case SDLK_KP_MINUS:
-            if (event_.key.keysym.mod & KMOD_ALT) {
+            if (keymod & KMOD_ALT) {
               shift_right_frames_ -= 100;
-            } else if (event_.key.keysym.mod & KMOD_CTRL) {
+            } else if (keymod & KMOD_CTRL) {
               shift_right_frames_ -= 10;
             } else {
               shift_right_frames_--;
             }
+            break;
+          case SDLK_y:
+            // Cycle through subtraction modes
+            switch (diff_mode_) {
+              case DiffMode::LegacyAbs:
+                diff_mode_ = DiffMode::AbsLinear;
+                break;
+              case DiffMode::AbsLinear:
+                diff_mode_ = DiffMode::AbsSqrt;
+                break;
+              case DiffMode::AbsSqrt:
+                diff_mode_ = DiffMode::SignedDiverging;
+                break;
+              case DiffMode::SignedDiverging:
+                diff_mode_ = DiffMode::LegacyAbs;
+                break;
+            }
+            std::cout << "Subtraction mode set to '";
+            switch (diff_mode_) {
+              case DiffMode::LegacyAbs:
+                std::cout << "ABSOLUTE LINEAR (FIXED GAIN)";
+                break;
+              case DiffMode::AbsLinear:
+                std::cout << "ABSOLUTE LINEAR (ADAPTIVE)";
+                break;
+              case DiffMode::AbsSqrt:
+                std::cout << "ABSOLUTE SQUARE ROOT";
+                break;
+              case DiffMode::SignedDiverging:
+                std::cout << "SIGNED DIVERGING";
+                break;
+            }
+            std::cout << "'" << std::endl;
+            break;
+          case SDLK_u:
+            diff_luma_only_ = !diff_luma_only_;
+            std::cout << "Subtraction luminance-only set to '" << (diff_luma_only_ ? "ON" : "OFF") << "'" << std::endl;
             break;
           default:
             break;
         }
         break;
       case SDL_KEYUP:
-        switch (event_.key.keysym.sym) {
+        switch (keycode) {
           case SDLK_z:
             zoom_left_ = false;
             break;

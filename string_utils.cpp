@@ -49,10 +49,70 @@ std::string format_duration(const float duration) {
   return duration > 0 ? format_position(duration, false) : "unknown duration";
 }
 
+double parse_strict_double(const std::string& s) {
+  if (s.empty()) {
+    throw std::invalid_argument("Empty string is not a valid float");
+  }
+
+  char* end = nullptr;
+  const char* str = s.c_str();
+  double val = std::strtod(str, &end);
+
+  if (end != (str + s.size()) || !std::isfinite(val)) {
+    throw std::invalid_argument("Invalid floating point string: " + s);
+  }
+
+  return val;
+}
+
+double parse_timestamps_to_seconds(const std::string& timestamp) {
+  std::istringstream ss(timestamp);
+  std::string token;
+  std::vector<std::string> parts;
+
+  // split the timestamp by ':'
+  while (std::getline(ss, token, ':')) {
+    parts.push_back(token);
+  }
+
+  if (parts.empty() || parts.size() > 3) {
+    throw std::invalid_argument("Invalid timestamp format");
+  }
+
+  // Initialize time components
+  int hours = 0, minutes = 0;
+  double seconds = 0.0;
+
+  try {
+    if (parts.size() == 3) {
+      hours = std::stoi(parts[0]);
+      minutes = std::stoi(parts[1]);
+      seconds = parse_strict_double(parts[2]);
+    } else if (parts.size() == 2) {
+      minutes = std::stoi(parts[0]);
+      seconds = parse_strict_double(parts[1]);
+    } else if (parts.size() == 1) {
+      seconds = parse_strict_double(parts[0]);
+    }
+  } catch (const std::exception& e) {
+    throw std::invalid_argument("Invalid numeric value in timestamp");
+  }
+
+  return hours * 3600.0 + minutes * 60.0 + seconds;
+}
+
 std::string to_lower_case(const std::string& str) {
   std::string tmp;
 
   std::transform(str.begin(), str.end(), std::back_inserter(tmp), ::tolower);
+
+  return tmp;
+}
+
+std::string to_upper_case(const std::string& str) {
+  std::string tmp;
+
+  std::transform(str.begin(), str.end(), std::back_inserter(tmp), ::toupper);
 
   return tmp;
 }
@@ -67,45 +127,45 @@ std::string::const_iterator string_ci_find(std::string& str, const std::string& 
   return (search(str.cbegin(), str.cend(), lower_case_query.cbegin(), lower_case_query.cend(), ci_compare_char));
 }
 
-std::string stringify_frame_rate(const AVRational frame_rate, const AVFieldOrder field_order) noexcept {
-  static const std::string postfix = "fps";
-
-  // format field order
-  std::string field_order_str;
-
+std::string stringify_field_order(const AVFieldOrder field_order, const std::string& unknown) noexcept {
   switch (field_order) {
     case AV_FIELD_PROGRESSIVE:
-      field_order_str = " (progressive)";
-      break;
+      return "progressive";
     case AV_FIELD_TT:
-      field_order_str = " (top first)";
-      break;
+      return "top first";
     case AV_FIELD_BB:
-      field_order_str = " (bottom first)";
-      break;
+      return "bottom first";
     case AV_FIELD_TB:
-      field_order_str = " (top coded first, swapped)";
-      break;
+      return "top coded first, swapped";
     case AV_FIELD_BT:
-      field_order_str = " (bottom coded first, swapped)";
-      break;
+      return "bottom coded first, swapped";
     default:
-      field_order_str = "";
+      return unknown;
   }
+}
+
+std::string stringify_frame_rate_only(const AVRational frame_rate) noexcept {
+  static const std::string postfix = "fps";
 
   // formatting code borrowed (with love!) from libavformat/dump.c
   const double d = av_q2d(frame_rate);
   const uint64_t v = lrintf(d * 100);
 
   if (!v) {
-    return string_sprintf("%1.4f %s%s", d, postfix.c_str(), field_order_str.c_str());
+    return string_sprintf("%1.4f %s", d, postfix.c_str());
   } else if (v % 100) {
-    return string_sprintf("%3.2f %s%s", d, postfix.c_str(), field_order_str.c_str());
+    return string_sprintf("%3.2f %s", d, postfix.c_str());
   } else if (v % (100 * 1000)) {
-    return string_sprintf("%1.0f %s%s", d, postfix.c_str(), field_order_str.c_str());
+    return string_sprintf("%1.0f %s", d, postfix.c_str());
   }
 
-  return string_sprintf("%1.0fk %s%s", d / 1000, postfix.c_str(), field_order_str.c_str());
+  return string_sprintf("%1.0fk %s", d / 1000, postfix.c_str());
+}
+
+std::string stringify_frame_rate(const AVRational frame_rate, const AVFieldOrder field_order) noexcept {
+  const auto field_order_str = stringify_field_order(field_order);
+
+  return stringify_frame_rate_only(frame_rate) + (field_order_str.empty() ? "" : " (" + field_order_str + ")");
 }
 
 std::string stringify_decoder(const VideoDecoder* video_decoder) noexcept {

@@ -14,6 +14,7 @@
 
 #ifdef _WIN32
 #include <Windows.h>
+#undef RELATIVE
 
 // Credits to Mircea Neacsu, https://github.com/neacsum/utf8
 char** get_argv(int* argc, char** argv) {
@@ -172,6 +173,81 @@ void find_matching_hw_accels(const std::string& search_string) {
   }
 }
 
+TimeShiftConfig parse_time_shift(const std::string& time_shift_arg) {
+  TimeShiftConfig config;
+
+  // Check if it's a simple number or time format, treat it as an offset
+  try {
+    const double offset = parse_timestamps_to_seconds(time_shift_arg);
+    config.offset_ms = static_cast<int64_t>(offset * 1000.0);
+    return config;
+  } catch (const std::logic_error& e) {
+    // If parsing as time format fails, continue with multiplier parsing
+  }
+
+  // Parse new format: [xmultiplier][+/-offset]
+  std::string remaining = time_shift_arg;
+
+  // Parse multiplier if present
+  if (remaining[0] == 'x') {
+    remaining = remaining.substr(1);  // Remove 'x'
+
+    // Find the end of the multiplier (either end of string or start of offset)
+    size_t multiplier_end = remaining.find_first_of("+-");
+    if (multiplier_end == std::string::npos) {
+      multiplier_end = remaining.length();
+    }
+
+    const std::string multiplier_str = remaining.substr(0, multiplier_end);
+    remaining = remaining.substr(multiplier_end);
+
+    // Check if it's a rational fraction (e.g., "25/24")
+    const std::regex number_re("^([0-9]+([.][0-9]*)?|[.][0-9]+)$");
+
+    size_t slash_pos = multiplier_str.find('/');
+    if (slash_pos != std::string::npos) {
+      std::string numerator_str = multiplier_str.substr(0, slash_pos);
+      std::string denominator_str = multiplier_str.substr(slash_pos + 1);
+
+      if (!std::regex_match(numerator_str, number_re) || !std::regex_match(denominator_str, number_re)) {
+        throw std::logic_error{"Cannot parse time shift multiplier; numerator and denominator must be valid postive numbers"};
+      }
+
+      const double numerator = parse_strict_double(numerator_str);
+      const double denominator = parse_strict_double(denominator_str);
+
+      if (denominator == 0) {
+        throw std::logic_error{"Cannot parse time shift multiplier; denominator cannot be zero"};
+      }
+
+      av_reduce(&config.multiplier.num, &config.multiplier.den, std::round(numerator * 10000), std::round(denominator * 10000), 1000000);
+    } else {
+      if (!std::regex_match(multiplier_str, number_re)) {
+        throw std::logic_error{"Cannot parse time shift multiplier; must be a valid positive number"};
+      }
+
+      config.multiplier = av_d2q(parse_strict_double(multiplier_str), 1000000);
+    }
+
+    // Prevent division by zero in inverse multiplier
+    if (config.multiplier.num == 0) {
+      throw std::runtime_error("Multiplier cannot be zero");
+    }
+  }
+
+  // Parse offset if present
+  if (!remaining.empty()) {
+    try {
+      double offset = parse_timestamps_to_seconds(remaining);
+      config.offset_ms = static_cast<int64_t>(offset * 1000.0);
+    } catch (const std::logic_error& e) {
+      throw std::logic_error{"Cannot parse time shift offset: " + std::string(e.what())};
+    }
+  }
+
+  return config;
+}
+
 const std::string get_nth_token_or_empty(const std::string& options_string, const char delimiter, const size_t n) {
   auto tokens = string_split(options_string, delimiter);
 
@@ -217,15 +293,25 @@ std::string safe_replace_placeholder(const std::string& template_str, const std:
   return replacement.empty() ? template_str : std::regex_replace(template_str, PLACEHOLDER_REGEX, replacement, std::regex_constants::format_first_only);
 }
 
-void resolve_mutual_placeholders(std::string& left, std::string& right, const std::string& type) {
+void resolve_mutual_placeholders(std::string& left, std::string& right, const std::string& type, bool only_replace_full_placeholder = false) {
   if ((contains_placeholder(left) && right.empty()) || (left.empty() && contains_placeholder(right))) {
     throw std::logic_error{"Cannot resolve placeholder in " + type + ": the other is empty and cannot be substituted."};
   }
 
-  if (contains_placeholder(left)) {
-    left = safe_replace_placeholder(left, right, type);
-  } else if (contains_placeholder(right)) {
-    right = safe_replace_placeholder(right, left, type);
+  if (only_replace_full_placeholder) {
+    if ((left == PLACEHOLDER) && (right == PLACEHOLDER)) {
+      throw std::logic_error{"Cannot resolve placeholder in " + type + ": the other is also a placeholder."};
+    } else if (left == PLACEHOLDER) {
+      left = right;
+    } else if (right == PLACEHOLDER) {
+      right = left;
+    }
+  } else {
+    if (contains_placeholder(left)) {
+      left = safe_replace_placeholder(left, right, type);
+    } else if (contains_placeholder(right)) {
+      right = safe_replace_placeholder(right, left, type);
+    }
   }
 }
 
@@ -245,7 +331,7 @@ int main(int argc, char** argv) {
          {"verbose", {"-v", "--verbose"}, "enable verbose output, including information such as library versions and rendering details", 0},
          {"high-dpi", {"-d", "--high-dpi"}, "allow high DPI mode for e.g. displaying UHD content on Retina displays", 0},
          {"10-bpc", {"-b", "--10-bpc"}, "use 10 bits per color component instead of 8", 0},
-         {"fast-alignment", {"-F", "--fast-alignment"}, "toggle faster bilinear scaling for aligning input source resolutions, replacing higher-quality bicubic interpolation when resolutions differ", 0},
+         {"fast-alignment", {"-F", "--fast-alignment"}, "toggle fast bilinear scaling for aligning input source resolutions, replacing high-quality bicubic and chroma-accurate interpolation", 0},
          {"bilinear-texture", {"-I", "--bilinear-texture"}, "toggle bilinear video texture interpolation, replacing nearest-neighbor filtering", 0},
          {"display-number", {"-n", "--display-number"}, "open main window on specific display (e.g. 0, 1 or 2), default is 0", 1},
          {"display-mode", {"-m", "--mode"}, "display mode (layout), 'split' for split screen (default), 'vstack' for vertical stack, 'hstack' for horizontal stack", 1},
@@ -253,7 +339,7 @@ int main(int argc, char** argv) {
          {"window-fit-display", {"-W", "--window-fit-display"}, "calculate the window size to fit within the usable display bounds while maintaining the video aspect ratio", 0},
          {"auto-loop-mode", {"-a", "--auto-loop-mode"}, "auto-loop playback when buffer fills, 'off' for continuous streaming (default), 'on' for forward-only mode, 'pp' for ping-pong mode", 1},
          {"frame-buffer-size", {"-f", "--frame-buffer-size"}, "frame buffer size (e.g. 10, 70 or 150), default is 50", 1},
-         {"time-shift", {"-t", "--time-shift"}, "shift the time stamps of the right video by a user-specified number of seconds (e.g. 0.150, -0.1 or 1)", 1},
+         {"time-shift", {"-t", "--time-shift"}, "shift the time stamps of the right video by a user-specified time offset, optionally with a multiplier (e.g. 0.150, -0.1, x1.04+0.1, x25.025/24-1:30.5)", 1},
          {"wheel-sensitivity", {"-s", "--wheel-sensitivity"}, "mouse wheel sensitivity (e.g. 0.5, -1 or 1.7), default is 1; negative values invert the input direction", 1},
          {"color-space", {"-C", "--color-space"}, "set the color space matrix, specified as [matrix] for the same on both sides, or [l-matrix?]:[r-matrix?] for different values (e.g. 'bt709' or 'bt2020nc:')", 1},
          {"color-range", {"-A", "--color-range"}, "set the color range, specified as [range] for the same on both sides, or [l-range?]:[r-range?] for different values (e.g. 'tv', ':pc' or 'pc:tv')", 1},
@@ -418,13 +504,16 @@ int main(int argc, char** argv) {
       }
       if (args["time-shift"]) {
         const std::string time_shift_arg = args["time-shift"];
-        const std::regex time_shift_re("^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)$");
 
-        if (!std::regex_match(time_shift_arg, time_shift_re)) {
-          throw std::logic_error{"Cannot parse time shift argument; must be a valid number in seconds, e.g. 1 or -0.333"};
+        try {
+          const TimeShiftConfig time_shift_config = parse_time_shift(time_shift_arg);
+          config.time_shift = time_shift_config;
+
+          const double multiplier_value = av_q2d(time_shift_config.multiplier);
+          std::cout << string_sprintf("Timeshift config: multiplier=%d/%d (x%.6f), offset=%ld ms", time_shift_config.multiplier.num, time_shift_config.multiplier.den, multiplier_value, time_shift_config.offset_ms) << std::endl;
+        } catch (const std::logic_error& e) {
+          throw std::logic_error{"Cannot parse time shift argument: " + std::string(e.what())};
         }
-
-        config.time_shift_ms = std::stod(time_shift_arg) * 1000.0;
       }
       if (args["wheel-sensitivity"]) {
         const std::string wheel_sensitivity_arg = args["wheel-sensitivity"];
@@ -434,7 +523,7 @@ int main(int argc, char** argv) {
           throw std::logic_error{"Cannot parse mouse wheel sensitivity argument; must be a valid number, e.g. 1.3 or -1"};
         }
 
-        config.wheel_sensitivity = std::stod(wheel_sensitivity_arg);
+        config.wheel_sensitivity = parse_strict_double(wheel_sensitivity_arg);
       }
       if (args["tone-map-mode"]) {
         const std::string tone_mapping_mode_arg = args["tone-map-mode"];
@@ -579,7 +668,7 @@ int main(int argc, char** argv) {
             throw std::logic_error{"Cannot parse " + to_lower_case(input_video.side_description) + " boost luminance argument; must be a valid number, e.g. 1.3 or 3.0"};
           }
 
-          return std::stod(boost_tone_arg);
+          return parse_strict_double(boost_tone_arg);
         };
 
         auto boost_tone_spec = static_cast<const std::string&>(args["boost-tone"]);
@@ -592,7 +681,7 @@ int main(int argc, char** argv) {
       config.left.file_name = args.pos[0];
       config.right.file_name = args.pos[1];
 
-      resolve_mutual_placeholders(config.left.file_name, config.right.file_name, "video file");
+      resolve_mutual_placeholders(config.left.file_name, config.right.file_name, "video file", true);
 
       if (args["libvmaf-options"]) {
         VMAFCalculator::instance().set_libvmaf_options(args["libvmaf-options"]);
